@@ -1,19 +1,23 @@
+# Makefile для сервера
+
+# Компилятор и флаги
 CXX = g++
-CXXFLAGS = -Wall -std=c++17 -I src
+CXXFLAGS = -Wall -Wextra -std=c++17 -O2
+LIBS = -lssl -lcrypto
 
+# Цели и исходные файлы
 TARGET = server
-SRCS = main.cpp server.cpp data_processor.cpp logger.cpp
-OBJS = $(SRCS:.cpp=.o)
+SRCS = server.cpp
 
+# Правила сборки
 all: $(TARGET)
 
-$(TARGET): $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(OBJS) -lssl -lcrypto
-
-src/%.o: src/%.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+$(TARGET): $(SRCS)
+	$(CXX) $(CXXFLAGS) $(SRCS) -o $(TARGET) $(LIBS)
 
 clean:
-	rm -f $(TARGET) src/*.o
+	rm -f $(TARGET)
+
+.PHONY: all clean
 
 

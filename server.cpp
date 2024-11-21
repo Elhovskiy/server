@@ -1,256 +1,220 @@
-#include "server.h"
-#include "data_processor.h"
-#include "logger.h"
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
 #include <iostream>
-#include <vector>
-#include <iomanip>
-#include <sstream>
 #include <fstream>
-#include <random>
-#include <openssl/sha.h>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <ctime>
+#include <cstdlib>
 #include <cstring>
+#include <iomanip>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <openssl/sha.h>
+#include <limits>
 
-using T = int16_t;  // Замените на нужный тип, если CODE изменен
+constexpr int DEFAULT_PORT = 22852;
+constexpr int VECTOR_OVERFLOW_VALUE = -32767;
+constexpr int BUFFER_SIZE = 1024;
 
-// Функция преобразования шестнадцатеричной строки в байтовый массив
-void hexStringToBytes(const std::string& hexStr, unsigned char* byteArray, size_t byteArraySize) {
-    for (size_t i = 0; i < byteArraySize; ++i) {
-        std::stringstream ss;
-        ss << std::hex << hexStr.substr(i * 2, 2);
-        int byte;
-        ss >> byte;
-        byteArray[i] = static_cast<unsigned char>(byte);
+// Логирование ошибок
+void logError(const std::string &logFile, const std::string &level, const std::string &message) {
+    std::ofstream outFile(logFile, std::ios::app);
+    if (outFile.is_open()) {
+        std::time_t now = std::time(nullptr);
+        char timeBuffer[64];
+        std::strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+        outFile << "[" << timeBuffer << "] [" << level << "] " << message << std::endl;
     }
 }
 
-Server::Server(uint16_t port, const std::string& clientDatabaseFile, const std::string& logFilePath)
-    : port(port), clientDatabaseFile(clientDatabaseFile), logFilePath(logFilePath) {
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == 0) {
-        logError(logFilePath, "Socket creation failed", true, "Error in socket() function");
-        exit(EXIT_FAILURE);
-    }
-
-    int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
-        logError(logFilePath, "Setsockopt failed", true, "Error in setsockopt() function");
-        exit(EXIT_FAILURE);
-    }
-
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port);
-
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        logError(logFilePath, "Bind failed", true, "Error in bind() function");
-        exit(EXIT_FAILURE);
-    }
-
-    if (listen(server_fd, 10) < 0) {
-        logError(logFilePath, "Listen failed", true, "Error in listen() function");
-        exit(EXIT_FAILURE);
-    }
-
-    loadDatabase();
+// Генерация случайной соли
+std::string generateSalt() {
+    uint64_t salt = static_cast<uint64_t>(rand()) << 32 | rand();
+    std::stringstream ss;
+    ss << std::uppercase << std::setfill('0') << std::setw(16) << std::hex << salt;
+    return ss.str();
 }
 
-void Server::loadDatabase() {
-    std::ifstream dbFile(clientDatabaseFile);
-    if (!dbFile.is_open()) {
-        logError(logFilePath, "Failed to open database file", true, clientDatabaseFile);
-        exit(EXIT_FAILURE);
+// Хэширование строки с использованием SHA-256
+std::string hashWithSHA256(const std::string &input) {
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char *>(input.c_str()), input.size(), hash);
+    std::stringstream ss;
+    for (size_t i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+        ss << std::uppercase << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
     }
+    return ss.str();
+}
 
+// Загрузка базы данных клиентов
+std::unordered_map<std::string, std::string> loadClientDatabase(const std::string &dbFile) {
+    std::unordered_map<std::string, std::string> clients;
+    std::ifstream inFile(dbFile);
+    if (!inFile.is_open()) {
+        throw std::runtime_error("Не удалось открыть файл базы данных клиентов.");
+    }
     std::string line;
-    while (std::getline(dbFile, line)) {
-        std::istringstream iss(line);
-        std::string username, password;
-        if (std::getline(iss, username, ':') && std::getline(iss, password)) {
-            userDatabase[username] = password;
+    while (std::getline(inFile, line)) {
+        auto delimiterPos = line.find(':');
+        if (delimiterPos != std::string::npos) {
+            std::string id = line.substr(0, delimiterPos);
+            std::string hash = line.substr(delimiterPos + 1);
+            clients[id] = hash;
         }
     }
-    dbFile.close();
+    return clients;
 }
 
-void Server::run() {
-    std::cout << "Server is listening on port " << port << std::endl;
-    sockaddr_in address;
-    int addrlen = sizeof(address);
+// Класс для работы с векторами
+class VectorProcessor {
+public:
+    // Метод для вычисления суммы элементов вектора
+    int16_t computeSum(const std::vector<int16_t>& vector) {
+        int32_t sum = 0;  // Используем int32_t для предотвращения переполнения при вычислениях
 
-    while (true) {
-        int client_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
-        if (client_socket < 0) {
-            logError(logFilePath, "Client accept failed", false, "Error in accept() function");
-            continue;
-        }
-        handleClient(client_socket);
-        close(client_socket);
-    }
-}
+        for (const auto& elem : vector) {
+            sum += elem;  // Суммируем элементы вектора
 
-void Server::handleClient(int client_socket) {
-    if (!authenticate(client_socket)) {
-        return;
-    }
+            // Проверка на переполнение суммы для типа int16_t
+            if (sum > std::numeric_limits<int16_t>::max()) {
+                return std::numeric_limits<int16_t>::max();  // Переполнение, возвращаем максимально возможное значение
+            }
 
-    if (!processVectors(client_socket)) {
-        const char* errorMsg = "Err: Vector processing failed";
-        send(client_socket, errorMsg, strlen(errorMsg), 0);
-    }
-}
-
-bool Server::authenticate(int client_socket) {
-    char username[256] = {0};
-    ssize_t bytesRead = read(client_socket, username, sizeof(username) - 1);
-
-    if (bytesRead <= 0) {
-        logError(logFilePath, "Failed to read username", false, "Client may have disconnected");
-        std::cerr << "Error: Failed to read username or timed out." << std::endl;
-        return false;
-    }
-
-    username[bytesRead] = '\0';
-    std::cout << "Received username: " << username << std::endl;
-
-    if (userDatabase.find(username) == userDatabase.end()) {
-        const char* response = "Err: User not found";
-        send(client_socket, response, strlen(response), 0);
-        std::cerr << "Error: User not found." << std::endl;
-        return false;
-    }
-
-    // Генерация соли
-    std::random_device rd;
-    std::mt19937_64 generator(rd());
-    uint64_t saltValue = generator();
-    
-    std::stringstream saltStream;
-    saltStream << std::setw(16) << std::setfill('0') << std::hex << std::uppercase << saltValue;
-    std::string saltString = saltStream.str();
-    std::cout << "Generated SALT: " << saltString << std::endl;
-
-    // Отправка соли клиенту
-    ssize_t sentBytes = send(client_socket, saltString.c_str(), saltString.size(), 0);
-    if (sentBytes != static_cast<ssize_t>(saltString.size())) {
-    	logError(logFilePath, "Failed to send full SALT to client", true, "Incomplete send");
-    	std::cerr << "Error: Failed to send full SALT." << std::endl;
-    	return false;
-	}
-
-    std::cout << "Sent SALT to client: " << saltString << std::endl;
-
-    // Получение хэша от клиента
-    char clientHashHex[64 + 1] = {0};  // Ожидаем 64 символа для SHA-256
-    bytesRead = read(client_socket, clientHashHex, sizeof(clientHashHex) - 1);
-
-    if (bytesRead != 64) {
-        logError(logFilePath, "Failed to read valid hash from client", false, "Invalid hash length");
-        std::cerr << "Error: Expected 64 bytes for hash, received " << bytesRead << " bytes." << std::endl;
-        return false;
-    }
-    std::cout << "Received hash from client: " << std::string(clientHashHex, bytesRead) << std::endl;
-
-    // Преобразование хэша клиента в байтовый массив
-    unsigned char clientHash[32];
-    hexStringToBytes(std::string(clientHashHex, 64), clientHash, 32);
-
-    // Сервер генерирует хэш для проверки
-    std::string password = userDatabase[username];
-    std::string combined = saltString + password;
-    unsigned char generatedHash[32];
-    SHA256(reinterpret_cast<const unsigned char*>(combined.c_str()), combined.size(), generatedHash);
-
-    // Сравнение с хэшем клиента
-    if (memcmp(generatedHash, clientHash, 32) == 0) {
-        const char* authResponse = "OK";
-        send(client_socket, authResponse, strlen(authResponse), 0);
-        std::cout << "Authentication successful. Sent 'OK' to client." << std::endl;
-        return true;
-    } else {
-        const char* authResponse = "Err";
-        send(client_socket, authResponse, strlen(authResponse), 0);
-        std::cerr << "Authentication failed. Sent 'Err' to client." << std::endl;
-        return false;
-    }
-}
-
-bool Server::processVectors(int client_socket) {
-    struct timeval timeout;
-    timeout.tv_sec = 5;
-    timeout.tv_usec = 0;
-    setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-
-    uint32_t numVectors = 0;
-    ssize_t bytesRead = read(client_socket, &numVectors, sizeof(numVectors));
-    if (bytesRead <= 0) {
-        logError(logFilePath, "Failed to read number of vectors or timed out", false, "Client may have disconnected");
-        return false;
-    }
-    std::cout << "Number of vectors received: " << numVectors << std::endl;
-
-    std::vector<int16_t> results;
-    for (uint32_t i = 0; i < numVectors; ++i) {
-        uint32_t vectorSize = 0;
-        bytesRead = read(client_socket, &vectorSize, sizeof(vectorSize));
-        if (bytesRead <= 0) {
-            logError(logFilePath, "Failed to read vector size or timed out", false, "Client may have disconnected");
-            return false;
-        }
-        std::cout << "Size of vector " << i + 1 << ": " << vectorSize << std::endl;
-
-        std::vector<T> vector(vectorSize);
-        for (uint32_t j = 0; j < vectorSize; ++j) {
-            bytesRead = read(client_socket, &vector[j], sizeof(T));
-            if (bytesRead <= 0) {
-                logError(logFilePath, "Failed to read vector value", false, "Client may have disconnected");
-                return false;
+            if (sum < std::numeric_limits<int16_t>::min()) {
+                return std::numeric_limits<int16_t>::min();  // Переполнение, возвращаем минимальное значение
             }
         }
 
-        int16_t result = processVector(vector);
-        results.push_back(result);
+        return static_cast<int16_t>(sum);  // Возвращаем результат как int16_t
     }
+};
 
-    // Отправка результатов клиенту
-    send(client_socket, results.data(), results.size() * sizeof(int16_t), 0);
-    return true;
+
+// Обработка клиента
+void handleClient(int clientSocket, const std::unordered_map<std::string, std::string> &clients, const std::string &logFile) {
+    try {
+        char buffer[BUFFER_SIZE];
+        // Шаг 2: Получение идентификатора клиента
+        int bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0);
+        if (bytesReceived <= 0) throw std::runtime_error("Ошибка при получении идентификатора.");
+
+        std::string clientID(buffer, bytesReceived);
+        std::cout << "Получен идентификатор клиента: " << clientID << std::endl;
+
+        // Шаг 3: Проверка идентификатора и генерация соли
+        auto it = clients.find(clientID);
+        if (it == clients.end()) {
+            send(clientSocket, "ERR", 3, 0);
+            throw std::runtime_error("Клиент не найден: " + clientID);
+        }
+        std::string salt = generateSalt();
+        send(clientSocket, salt.c_str(), salt.size(), 0);
+        std::cout << "Сгенерированная соль: " << salt << std::endl;
+
+        // Шаг 4: Получение хэша пароля
+        bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0);
+        if (bytesReceived <= 0) throw std::runtime_error("Ошибка при получении хэша.");
+
+        std::string receivedHash(buffer, bytesReceived);
+        std::string expectedHash = hashWithSHA256(salt + it->second);
+
+        // Шаг 5: Проверка хэша
+        if (receivedHash != expectedHash) {
+            send(clientSocket, "ERR", 3, 0);
+            throw std::runtime_error("Ошибка аутентификации клиента: " + clientID);
+        }
+        send(clientSocket, "OK", 2, 0);
+
+        // Шаги 6-11: Обработка векторов
+        uint32_t numVectors = 0;
+        recv(clientSocket, &numVectors, sizeof(numVectors), 0);  // Количество векторов
+        std::cout << "Получено число векторов: " << numVectors << std::endl;
+
+        VectorProcessor processor; // Инициализация processor
+
+        for (uint32_t i = 0; i < numVectors; ++i) {
+            uint32_t vectorSize = 0;
+            recv(clientSocket, &vectorSize, sizeof(vectorSize), 0);  // Размер вектора
+            std::cout << "Получен размер вектора: " << vectorSize << std::endl;
+
+            std::vector<int16_t> vec(vectorSize);
+            size_t bytesReceived = recv(clientSocket, vec.data(), vectorSize * sizeof(int16_t), 0);  // Получение значений вектора
+            std::cout << "Ожидаемое количество байт: " << vectorSize * sizeof(int16_t) << ", фактически получено: " << bytesReceived << std::endl;
+
+            if (bytesReceived != vectorSize * sizeof(int16_t)) {
+                std::cerr << "Ошибка: получено " << bytesReceived << " байт вместо " << vectorSize * sizeof(int16_t) << std::endl;
+                continue;
+            }
+
+            std::cout << "Получены значения вектора: ";
+            for (auto val : vec) {
+                std::cout << val << " ";
+            }
+            std::cout << std::endl;
+
+            // Вычисление и отправка результата
+            int16_t result = processor.computeSum(vec);
+            send(clientSocket, &result, sizeof(result), 0);
+            std::cout << "Результат для вектора " << i + 1 << ": " << result << std::endl;
+        }
+
+    } catch (const std::exception &e) {
+        logError(logFile, "ERROR", e.what());
+    }
+    close(clientSocket);
 }
 
-int16_t Server::processVector(const std::vector<T>& vector) {
-    // Пример простой обработки вектора
-    int16_t result = 0;
-    for (const T& value : vector) {
-        result += value;
+
+// Главная функция
+int main(int argc, char *argv[]) {
+    if (argc < 3) {
+        std::cerr << "Использование: " << argv[0] << " <client_db_file> <log_file> [port]" << std::endl;
+        return EXIT_FAILURE;
     }
-    return result;
+
+    std::string clientDBFile = argv[1];
+    std::string logFile = argv[2];
+    int port = (argc > 3) ? std::stoi(argv[3]) : DEFAULT_PORT;
+
+    try {
+        auto clients = loadClientDatabase(clientDBFile);
+
+        int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+        if (serverSocket == -1) throw std::runtime_error("Ошибка создания сокета.");
+
+        sockaddr_in serverAddr{};
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(port);
+        serverAddr.sin_addr.s_addr = INADDR_ANY;
+
+        if (bind(serverSocket, (sockaddr *)&serverAddr, sizeof(serverAddr)) < 0)
+            throw std::runtime_error("Ошибка привязки сокета.");
+
+        if (listen(serverSocket, 5) < 0) throw std::runtime_error("Ошибка запуска прослушивания.");
+
+        std::cout << "Сервер запущен на порту " << port << std::endl;
+
+        while (true) {
+            sockaddr_in clientAddr{};
+            socklen_t clientLen = sizeof(clientAddr);
+            int clientSocket = accept(serverSocket, (sockaddr *)&clientAddr, &clientLen);
+            if (clientSocket < 0) {
+                logError(logFile, "WARNING", "Ошибка подключения клиента.");
+                continue;
+            }
+            handleClient(clientSocket, clients, logFile);
+        }
+
+        close(serverSocket);
+
+    } catch (const std::exception &e) {
+        logError(logFile, "CRITICAL", e.what());
+        return EXIT_FAILURE;
+    }
+
+    return EXIT_SUCCESS;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
